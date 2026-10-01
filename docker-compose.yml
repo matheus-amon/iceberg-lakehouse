@@ -1,0 +1,134 @@
+# Desvio consciente do plano: a task TRA-45 especifica MinIO como object store.
+# O repositório minio/minio no Docker Hub foi removido -- toda tag e espelho
+# retorna "pull access denied for minio/minio, repository does not exist".
+# Redpanda, Flink e Trino puxam normalmente, entao o problema e especifico do
+# MinIO, nao da rede.
+#
+# O warehouse do Iceberg portanto vive num volume Docker compartilhado no
+# sistema de arquivos, lido e escrito pelo Flink e pelo Trino. Isso nao troca o
+# Iceberg, nem o formato v2, nem o upsert, nem o particionamento -- que e o que a
+# task quer provar. O que se perde e o object store, que aqui nunca foi o
+# argumento: era "sobe com docker compose up", e isso continua valendo.
+
+name: iceberg-lakehouse
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:v24.2.18
+    container_name: lakehouse-redpanda
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp 1
+      - --memory 512M
+      - --reserve-memory 0M
+      - --node-id 0
+      - --check=false
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:9092
+    ports:
+      - "9092:9092"
+      - "9644:9644"
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      # `cluster info` only succeeds once the broker is actually serving, so
+      # this gates the job on Redpanda instead of on a sleep.
+      test: ["CMD", "rpk", "cluster", "info", "--brokers", "localhost:9092"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 15s
+
+  jobmanager:
+    build:
+      context: ./flink
+    image: lakehouse-flink:local
+    container_name: lakehouse-jobmanager
+    command: jobmanager
+    ports:
+      - "8081:8081"
+    volumes:
+      - warehouse:/warehouse
+      - flink_checkpoints:/checkpoints
+      - ./flink:/opt/job:ro
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        state.backend: filesystem
+        state.checkpoints.dir: file:///checkpoints
+        execution.checkpointing.interval: 10s
+        execution.checkpointing.mode: EXACTLY_ONCE
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8081/overview || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+
+  taskmanager:
+    build:
+      context: ./flink
+    image: lakehouse-flink:local
+    container_name: lakehouse-taskmanager
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        state.backend: filesystem
+        state.checkpoints.dir: file:///checkpoints
+    volumes:
+      - warehouse:/warehouse
+      - flink_checkpoints:/checkpoints
+    depends_on:
+      jobmanager:
+        condition: service_healthy
+
+  # The producer runs inside the compose network. Redpanda advertises its
+  # listener as `redpanda:9092`, so a host-side client connects to
+  # localhost:9092, reads metadata pointing at `redpanda:9092`, and then hangs
+  # for 60s failing to resolve a name that only exists in here. See
+  # generator/Dockerfile.
+  generator:
+    build:
+      context: .
+      dockerfile: generator/Dockerfile
+    image: lakehouse-generator:local
+    profiles: ["tools"]
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    command: ["--help"]
+
+  trino:
+    build:
+      context: ./trino
+    image: lakehouse-trino:local
+    container_name: lakehouse-trino
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./trino/etc:/etc/trino:ro
+      # Same volume Flink writes to. Trino's `hadoop` catalog reads Iceberg
+      # metadata straight off this path, so no metastore is involved.
+      - warehouse:/warehouse:ro
+      # The JDBC catalog's SQLite database lives here, not in the image, so it
+      # survives a container recreate.
+      - trino_catalog:/var/lib/trino
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 5s
+      timeout: 10s
+      retries: 60
+      start_period: 30s
+
+volumes:
+  redpanda_data:
+  warehouse:
+  flink_checkpoints:
+  trino_catalog:
