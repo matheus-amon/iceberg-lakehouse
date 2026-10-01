@@ -105,20 +105,46 @@ services:
         condition: service_healthy
     command: ["--help"]
 
+  # One-shot: creates the Iceberg JDBC catalog schema. Trino never calls
+  # JdbcCatalog.initialize(), which is the method that would create
+  # `iceberg_tables`, so without this the catalog loads and then fails every
+  # query with "Failed to execute query: SELECT ... FROM iceberg_tables".
+  catalog-init:
+    image: python:3.11-slim
+    # Runs as root and chowns the file to uid 1000 (the `trino` user in the Trino
+    # image). It has to be root: the volume mounts root-owned 0755, so uid 1000
+    # cannot create anything in it. And the file must end up owned by 1000, or
+    # Trino cannot write to its own catalog and every CREATE SCHEMA fails with
+    # SQLITE_READONLY.
+    user: "0:0"
+    volumes:
+      - ./scripts/init-catalog.py:/init-catalog.py:ro
+      - trino_catalog:/var/lib/trino
+    environment:
+      CATALOG_DB_PATH: /var/lib/trino/iceberg-catalog.db
+      CATALOG_OWNER: "1000:1000"
+    entrypoint: ["python", "/init-catalog.py"]
+    restart: "no"
+
   trino:
     build:
       context: ./trino
     image: lakehouse-trino:local
     container_name: lakehouse-trino
     ports:
-      - "8080:8080"
+      # 8081 not 8080: Airflow's webserver already holds 8080 on this machine.
+      # The host port is a convenience, not part of the contract — Trino is
+      # reached in-network as `trino:8080` by the observability code.
+      - "8090:8080"
     volumes:
       - ./trino/etc:/etc/trino:ro
       # Same volume Flink writes to. Trino's `hadoop` catalog reads Iceberg
       # metadata straight off this path, so no metastore is involved.
       - warehouse:/warehouse:ro
       # The JDBC catalog's SQLite database lives here, not in the image, so it
-      # survives a container recreate.
+      # survives a container recreate. Not :ro — Trino writes namespace and
+      # table rows into it, and a read-only SQLite file fails every CREATE
+      # SCHEMA with SQLITE_READONLY.
       - trino_catalog:/var/lib/trino
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]

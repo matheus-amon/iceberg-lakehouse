@@ -21,6 +21,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 TRINO_HOST = os.getenv("TRINO_HOST", "localhost")
+# The in-network port. Trino listens on 8080 inside the compose network even
+# though the host publishes it on 8090, because Airflow's webserver already
+# holds 8080 on this machine. Reaching it from the host needs TRINO_PORT=8090.
 TRINO_PORT = int(os.getenv("TRINO_PORT", "8080"))
 TRINO_CATALOG = os.getenv("TRINO_CATALOG", "iceberg")
 TRINO_SCHEMA = os.getenv("TRINO_SCHEMA", "lakehouse")
