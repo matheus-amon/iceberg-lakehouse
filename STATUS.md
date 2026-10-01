@@ -34,19 +34,47 @@ WHERE catalog_name = ?
 ```
 
 O ficheiro SQLite é criado (0 bytes, dono `trino`), mas a tabela `iceberg_tables`
-nunca é criada — a biblioteca JDBC do Iceberg inicializa o esquema em
-`catalog_type` e parece não o fazer para SQLite nesta versão do Trino.
+nunca é criada — o Trino nunca chama `JdbcCatalog.initialize()`, e é esse método
+que a cria.
 
-Candidatos a testar, por ordem de custo:
+**Resolvido até meio.** O esquema passa a ser criado por
+`scripts/init-catalog.py`, com o DDL transcrito do `iceberg-core` 1.7.1
+(`JdbcUtil.V0_CREATE_CATALOG_SQL`) em vez de escrito de memória, e verificado com
+`PRAGMA table_info` antes de reportar sucesso. O Trino carrega o catálogo e
+responde a queries.
 
-1. Pré-criar `iceberg_tables` com o esquema exato do Iceberg JDBC catalog, em vez
-   de deixar a biblioteca hacerlo.Um `.sql` versionado resolve.
-2. Usar o `REST` catalog com `apache/iceberg-rest-catalog` — a imagem não
-   não está acessível a partir deste ambiente, tal como o MinIO.
-3. Usar `NESSIE` com `ghcr.io/projectnessie/nessie`.
+**O que continua bloqueado:** o Trino não lê a tabela que o Flink escreveu.
 
-Não escolhi nenhum por conta própria: cada um muda o `docker compose up` que o
-projecto promete ser um comando, e essa decisão é do dono do repo.
+Dois catálogos diferentes sobre o mesmo directório de warehouse **não partilham
+um registo**. O Flink escreve com `catalog-type = hadoop` e cria
+`/warehouse/default_database/events/` com os seus próprios metadados; o Trino lê
+com `catalog-type = jdbc` e só vê o que está na sua tabela `iceberg_tables`.
+Registar a tabela exige um `metadata_location` que o catálogo do Trino aceite, e
+o `version-hint` já está em 3 enquanto o `v1.metadata.json` é o metadata base.
+
+Estava a ponto de editar internos do catálogo à mão, que é exactamente a falha
+"capacidade declarada mas não ligada" que tenho estado a criticar nos repos dos
+outros. Parei aí.
+
+Opções honestas, ambas mudam a promessa do `docker compose up`:
+
+1. **REST catalog partilhado** pelos dois lados. É o arranjo correcto, mas
+   `apache/iceberg-rest-catalog` não é puxável deste ambiente — tal como o
+   MinIO.
+2. **Fazer o Trino ler o path de metadados directamente**, sem catálogo, o que
+   exige registar a tabela por `metadata_location` a cada execução. Mais
+   frágil.
+
+### Desvios desta fase
+
+| Problema | Decisão | Porquê |
+|---|---|---|
+| Trino só aceita `REST`/`GLUE`/`JDBC`/`NESSIE` | JDBC sobre SQLite | `hadoop` e `hive` foram removidos; SQLite é o único dos quatro que não exige um segundo serviço |
+| `iceberg.resource-vending.enabled` rejeitado | removido | A versão do conector não reconhece a chave e recusa arrancar com uma propriedade por ela usar |
+| `iceberg.jdbc-catalog.init-catalog-tables` rejeitado | removido | Trino 439 não expõe a chave; o valor teria de vir do script |
+| Volume do catálogo é root-owned | `catalog-init` corre como root e dá `chown -R` do **directório** ao uid 1000 | O ficheiro sozinho não chega: o SQLite cria um journal ao lado em cada escrita, e o erro aponta para o journal em vez da ownership |
+| `catalog-init` atrás de `profiles` | removido | Um serviço com profile de que outro depende é ignorado em silêncio por `up`, e o contentor sai com 0 sem fazer nada |
+| Porta 8080 ocupada pelo Airflow | Trino publica em 8090 | A porta dentro da rede continua 8080; o observatório não muda |
 
 ## TRA-46 — Fase 2: observabilidade
 
