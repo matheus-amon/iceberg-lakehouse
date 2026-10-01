@@ -12,6 +12,10 @@ checkpoints/
 coverage/
 *.db
 
+# The Trino JDBC driver is the exception to the "no jars" rule: it is vendored
+# in trino/ and committed, so `docker compose build` does not depend on Maven
+# Central being reachable.
+
 # Editors
 .DS_Store
 .idea/
